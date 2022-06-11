@@ -1,0 +1,1217 @@
+#!/bin/bash -e
+#L:
+#L:  MIT License
+#L:  
+#l:  Bug reports, feature requests to gemini|https://harkadev.com/oss
+#l:  Copyright (c) 2022 Harkaitz Agirre, harkaitz.aguirre@gmail.com
+#L:
+#L:  Permission is hereby granted, free of charge, to any person obtaining
+#L:  a copy of this software and associated documentation files (the
+#L:  "Software"), to deal in the Software without restriction, including
+#L:  without limitation the rights to use, copy, modify, merge, publish,
+#L:  distribute, sublicense, and/or sell copies of the Software, and to
+#L:  permit persons to whom the Software is furnished to do so, subject to
+#L:  the following conditions:
+#L:
+#L:  The above copyright notice and this permission notice shall be
+#L:  included in all copies or substantial portions of the Software.
+#L:
+#L:  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+#L:  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+#L:  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+#L:  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+#L:  LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+#L:  OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+#L:  WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+##:
+#h: Usage: $0 [-t][-c ORG] ...
+#h:
+#h: User management system integrated with stripe.
+#h:
+#h: ## CGI Interface.
+#h:
+#h: - op=verify   s=SERVICE email=EMAIL code=CODE
+#h: - op=login    s=SERVICE email=EMAIL pass=PASS [auth=PRODUCT]
+#h: - op=register s=SERVICE email=EMAIL pass=PASS
+#h:
+#h: ## Initial configuration.
+#h:
+#h: ... show                       : Show configuration.
+#h: ... ping                       : Check the connection is okey.
+#h: ... tax-list                   : List created taxes.
+#h: ... tax-edit [i=ID] ...        : Create/Edit tax.
+#h:     t=TYPE j=ES n=NAME p=PERC
+#h:     d=DESC a=ACTIVE
+#h:
+#h: ## Create services.
+#h:
+#h: ... sub-list         : List defined subscriptions.
+#h: ... sub-edit [i=ID]  : Create/Edit subscription.
+#h:     n=NAME u=URL a=CENTS
+#h:     p=PERIOD{w,d,y,m} d=DESC
+#h:
+#h: ## User/customer management.
+#h:
+#h: ... userlist
+#h: ... useradd      [i=1] e=EMAIL p=PASS l=LANG
+#h: ... useradd-mail [i=1] e=EMAIL p=PASS l=LANG
+#h: ... usermod ID OPTS...
+#h:     a_city=T   a_country=T     a_line1=T
+#h:     a_line2=T  a_postal_code=T a_state=T
+#h:     d=DESC     e=EMAIL         n=NAME
+#h:     p=PHONE    cif=NUM         pass=PASSWD
+#h: ... userdel     CUSTOMER-ID
+#h: ... send-verify CUSTOMER-ID
+#h: ... test-verify CUSTOMER-ID : Print code instead of emailing.
+#h: ... recv-verify EMAIL CODE
+#h:
+#h: ... login [i=1] e=EMAIL p=PASS a=AUTH > CUSTOMER-ID
+#h: ... auths CUSTOMER-ID > SERVICES
+#h: ... info  CUSTOMER-ID
+#h:
+#h: ## User checking out.
+#h:
+#h: ... ses-new s=ID ... : Create new session.
+#h:     c=CUSTOMER us=URL-SUCCESS uc=URL-CANCEL
+#h:     r=REFERENCE b=BROWSER
+shopt -s inherit_errexit
+pstripe() {
+    ## Parse options.
+    local OPTIND optopt=
+    while getopts "vtc:" optopt; do
+        case $optopt in
+            v)  local VERBOSE=y                   ;;
+            t)  local TEST_MODE=yes               ;;
+            c)  local PSTRIPE_SERVICE="${OPTARG}" ;;
+            \?) return 1                          ;;
+        esac
+    done
+    shift $(( $OPTIND - 1 ))
+    ## Load service.
+    if test -n "${PSTRIPE_SERVICE}"; then
+        if ! which pstripe_"${PSTRIPE_SERVICE}" >/dev/null 2>&1; then
+            error "Can't find an script named 'pstripe_${PSTRIPE_SERVICE}'."
+            return 1
+        fi
+        . pstripe_"${PSTRIPE_SERVICE}"
+    fi
+    ## No options, print help.
+    if test ! -n "${1}"; then
+        sed -n 's/^ *#h: \{0,1\}//p' "$0" | sed "s|\\\$0|${SCRNAME}|g"
+        echo ""
+        sed -n 's/^ *#l: \{0,2\}//p' "$0"
+        return 0
+    fi
+    ## Check programs are installed.
+    pstripe_check_programs
+    ## Perform operations.
+    local cmd="$1" ANS=
+    shift
+    case "${cmd}" in
+        show)         pstripe_show_variables                               ;;
+        ping)         pstripe_ping_ANS; printf '%s\n' "${ANS}"             ;;
+        userlist)     pstripe_userlist     "$@"                            ;;
+        useradd)      pstripe_useradd_JSON "$@"; jq -r '.id' <<< "${JSON}" ;;
+        useradd-mail) pstripe_useradd_mail "$@"; jq -r '.id' <<< "${JSON}" ;;
+        usermod)      pstripe_usermod_JSON  "$@"                           ;;
+        userdel)      pstripe_userdel       "$@"                           ;;
+        send-verify)  pstripe_send_verify   "$@"                           ;;
+        test-verify)  pstripe_test_verify   "$@"                           ;;
+        recv-verify)  pstripe_recv_verify   "$@"                           ;;
+        login)        pstripe_login         "$@"                           ;;
+        userinfo)     pstripe_userinfo_JSON "$@"; printf '%s\n' "${JSON}"  ;;
+        tax-list)     pstripe_tax_list      "$@"                           ;;
+        tax-edit)     pstripe_tax_edit      "$@"                           ;;
+        sub-list)     pstripe_sub_list      "$@"                           ;;
+        sub-edit)     pstripe_sub_edit      "$@"                           ;;
+        ses-new)      pstripe_session_new_ID_URL "$@"; printf '%s\n' "${URL}" ;;
+        auths)        pstripe_auths              "$@"              ;;
+        *)            error "Invalid argument: ${cmd}"; return 1;;
+    esac
+}
+pstripe_hook() {
+    case "${h_op}" in
+        verify)   pstripe_hook_verify   ;;
+        login)    pstripe_hook_login    ;;
+        register) pstripe_hook_register ;;
+        auths)    pstripe_hook_auths    ;;
+        userinfo) pstripe_hook_userinfo ;;
+        usermod)  pstripe_hook_usermod  ;;
+        ses-new)  pstripe_hook_ses_new  ;;
+        *)        pstripe_cgi_success_exit "O" </dev/null;;
+    esac
+}
+pstripe_show_variables() {
+    printf '%-28s : %s\n'                                                 \
+           "## Authentication"          ""                                \
+           TEST_MODE                    "${TEST_MODE}"                    \
+           STRIPE_PUBLIC_KEY            "${STRIPE_PUBLIC_KEY}"            \
+           STRIPE_SECRET_KEY            "${STRIPE_SECRET_KEY}"            \
+           STRIPE_TEST_PUBLIC_KEY       "${STRIPE_TEST_PUBLIC_KEY}"       \
+           STRIPE_TEST_SECRET_KEY       "${STRIPE_TEST_SECRET_KEY}"       \
+           "## Taxes"                   ""                                \
+           STRIPE_TAX_CODE              "${STRIPE_TAX_CODE}"              \
+           STRIPE_TAX_RATE              "${STRIPE_TAX_RATE}"              \
+           "## Client authentication"   ""                                \
+           PSTRIPE_SALT                 "${PSTRIPE_SALT}"                 \
+           PSTRIPE_VERIFY_MAIL_TEMPLATE "${PSTRIPE_VERIFY_MAIL_TEMPLATE}" \
+           PSTRIPE_VERIFY_MAIL_HOOK     "${PSTRIPE_VERIFY_MAIL_HOOK}"     \
+           "## Client contacting"       ""                                \
+           PSTRIPE_MSMTP_ACCOUNT        "${PSTRIPE_MSMTP_ACCOUNT}"        \
+           PSTRIPE_ORGANIZATION_NAME    "${PSTRIPE_ORGANIZATION_NAME}"    \
+           "## Hook"                    ""                                \
+           PSTRIPE_CACHE                "${PSTRIPE_CACHE}"                \
+           PSTRIPE_HOOK_PASSWORD        "${PSTRIPE_HOOK_PASSWORD}"        \
+           PSTRIPE_HOOK_LOG             "${PSTRIPE_HOOK_LOG}"             \
+           PSTRIPE_HTML_TEMPLATE        "${PSTRIPE_HTML_TEMPLATE}"        \
+           CURRENCY                     "${CURRENCY}"                     \
+           LANG                         "${LANG}"                         \
+           VERBOSE                      "${VERBOSE}"
+}
+pstripe_calc_variables() {
+    ## Error storing.
+    PSTRIPE_ERRORS="`mktemp -u`"
+    ## Authentication
+    TEST_MODE=yes
+    ## Client authentication.
+    PSTRIPE_SALT="${PSTRIPE_SALT:-pstripe}"
+    PSTRIPE_HOOK_LOG="${PSTRIPE_HOOK_LOG:-${HOME}/.pstripe.log}"
+    PSTRIPE_CACHE="${HOME}/.pstripe-cache"
+    ## Internationalization.
+    CURRENCY="eur"
+    if test -n "${h_lang}"; then
+        export LANG="${h_lang}"
+    else
+        export LANG="${LANG:-en_US.UTF-8}"
+    fi
+}
+pstripe_check_programs() {
+    local ret='0'
+    if ! which jq >/dev/null 2>&1; then
+        error "Program 'jq' not found."
+        ret=1
+    fi
+    if ! which stripe >/dev/null 2>&1; then
+        error "Stripe CLI client not found."
+        ret=1
+    fi
+    if ! which openssl >/dev/null 2>&1; then
+        error "Program 'openssl' not found."
+        ret=1
+    fi
+    if ! which cracklib-check >/dev/null 2>&1; then
+        error "Program 'cracklib-check' not found. Install 'cracklib'."
+        ret=1
+    fi
+    if ! which msmtp >/dev/null 2>&1; then
+        error "Program 'msmtp' not found."
+        ret=1
+    fi
+    if ! which uuidgen >/dev/null 2>&1; then
+        error "Program 'uuidgen' not found."
+        ret=1
+    fi
+    if ! which curl >/dev/null 2>&1; then
+        error "Program 'curl' not found."
+        ret=1
+    fi
+    return "${ret}"
+}
+## -----------------------------------------------------------------------------
+## ---- CONFIGURATION ----------------------------------------------------------
+## -----------------------------------------------------------------------------
+pstripe_ping_ANS() {
+    stripe_JSON status --hide-spinner --format json
+    local status="$(jq -r '."status"' <<< "${JSON}")"
+    case "${status}" in
+        up) ANS="up"   ;;
+        *)  ANS="down" ;;
+    esac
+}
+pstripe_tax_list() {
+    stripe_curl_JSON -G "https://api.stripe.com/v1/tax_rates" -d limit=100
+    jq -r '
+       .data[] |
+       .id + " "           +
+       .jurisdiction + " " +
+       .display_name + " " +
+       (.percentage|tostring) +
+       " active=" + (.active|tostring)
+    ' <<< "${JSON}"
+}
+pstripe_tax_edit() {
+    ## Parse command line arguments.
+    local id=
+    local tax_type="vat"
+    local jurisdiction=
+    local display_name=
+    local percentage=
+    local description=
+    local active=
+    while test -n "${1}"; do
+        local var="$(sed -n 's|=.*||p'     <<< "${1}")"
+        local val="$(sed -n 's|^[^=]*=||p' <<< "${1}")"
+        case "${var}" in
+            i|id)                local id="${val}"           ;;
+            t|tax_type|type)     local tax_type="${val}"     ;;
+            j|jurisdiction)      local jurisdiction="${val}" ;;
+            n|name|display_name) local display_name="${val}" ;;
+            p|percentage)        local percentage="${val}"   ;;
+            d|description)       local description="${val}"  ;;
+            a|active)            local active="${val}"       ;;
+            *)                   error "Invalid argument: ${1}"; return 1;;
+        esac
+        shift
+    done
+    ## Edit tax rate.
+    if test -n "${id}"; then
+        if test -n "${percentage}"; then
+            error "Changing the percentage is not allowed."
+            return 1
+        fi
+        stripe_curl_JSON                      \
+            "https://api.stripe.com/v1/tax_rates/${id}" \
+            ${tax_type:+     -d tax_type="${tax_type}"         } \
+            ${jurisdiction:+ -d jurisdiction="${jurisdiction}" } \
+            ${display_name:+ -d display_name="${display_name}" } \
+            ${inclusive:+    -d inclusive="false"              } \
+            ${description:+  -d description="${description}"   } \
+            ${active:+       -d active="${active}"             }
+    ## Check arguments.
+    elif test ! -n "${tax_type}"; then
+        error "Invalid tax type."
+        return 1
+    elif test ! -n "${jurisdiction}"; then
+        error "Please specify a jurisdiction country code."
+        return 1
+    elif test ! -n "${display_name}"; then
+        error "Please specify a display name."
+        return 1
+    elif test ! -n "${percentage}"; then
+        error "Please specify a tax percentage."
+        return 1
+    ## Create tax rate.
+    else
+        verbose "Creating new tax rate: ${jurisdiction} ${display_name} ${percentage}"
+        stripe_JSON                          \
+            tax_rates create                 \
+            --tax-type="${tax_type}"         \
+            --jurisdiction="${jurisdiction}" \
+            --display-name="${display_name}" \
+            --percentage="${percentage}"     \
+            --inclusive="false"              \
+            ${description:+ --description="${description}" }
+    fi
+    local id=$(jq -r '.id' <<< "${JSON}")
+    printf '%s\n' "${id}"
+}
+## -----------------------------------------------------------------------------
+## ---- SERVICE CREATION -------------------------------------------------------
+## -----------------------------------------------------------------------------
+pstripe_sub_list() {
+    local IFS=','
+    stripe_JSON products list --active=true
+    jq -r '
+    .data[] |
+    select(.metadata.prog == "pstripe") |
+    .id + "," + .default_price + "," + .name
+    ' <<< "${JSON}" | while  read prod price name; do
+        if test ! -n "${price}" ; then
+            continue
+        fi
+        stripe_JSON prices retrieve "${price}"
+        printf '%s %-10s ' "${prod} ${name}"
+        jq -r '
+            (.recurring.interval_count|tostring) +
+            .recurring.interval                  +
+            ","                                  +
+            (.unit_amount/100|tostring)          +
+            ","                                  +
+            .currency' <<< "${JSON}"
+        
+    done
+}
+pstripe_sub_edit() {
+    ## Check configuration.
+    if test ! -n "${STRIPE_TAX_CODE}"; then
+        error "Please set STRIPE_TAX_CODE."
+        return 1
+    fi
+    ## Parse command line arguments.
+    local id= name= url= amount= period=
+    local description= command=create
+    while test -n "${1}"; do
+        local var="$(sed -n 's|=.*||p'     <<< "${1}")"
+        local val="$(sed -n 's|^[^=]*=||p' <<< "${1}")"
+        case "${var}" in
+            i|id)          local id="${val}"          ;;
+            n|name)        local name="${val}"        ;;
+            u|url)         local url="${val}"         ;;
+            a|amount)      local amount="${val}"      ;;
+            p|period)      local period="${val}"      ;;
+            d|description) local description="${val}" ;;
+            *)             error "Invalid argument: ${cmd}"; return 1 ;;
+        esac
+        shift
+    done
+    ## Check the period.
+    if test -n "${period}"; then
+        local period_sed_count='s|^\([0-9][0-9]*\)[mdwy]$|\1|p'
+        local period_sed_unit=' s|^[0-9][0-9]*\([mdwy]\)$|\1|p'
+        local period_count="`sed -n "${period_sed_count}" <<< "${period}"`"
+        local period_unit="` sed -n "${period_sed_unit}"  <<< "${period}"`"
+        case "${period_count}" in
+            '') error "Invalid interval: ${period}: Shall be <NUM>{m,d,w,y}"
+                return 1
+        esac
+        case "${period_unit}" in
+            d|day)   local period_unit=day   ;;
+            m|month) local period_unit=month ;;
+            w|week)  local period_unit=week  ;;
+            y|year)  local period_unit=year  ;;
+            *)       error "Invalid period: ${period_unit}: Shall be d|m|w|y."
+                     return 1;;
+        esac
+    fi
+    ## If the product exists, modify.
+    if test -n "${id}"; then
+        stripe_JSON products update "${id}"
+        if test -n "${JSON}"; then
+            local command=update
+        fi
+    fi
+    ## When creating require some parameters.
+    if test @"${command}" = @"create"; then
+        if test ! -n "${name}"; then
+            error "Please specify a name. (n=NAME)"
+            return 1
+        elif test ! -n "${amount}"; then
+            error "Please specify an amount. (a=CENTS)"
+            return 1
+        elif test ! -n "${period}"; then
+            error "Please specify a period. (p=NUM{w,d,y,m})"
+            return 1
+        fi
+    fi
+    ## Create/modify product.
+    case "${command}" in
+        create) verbose "Creating new product (id=${id}) ..." ;;
+        update) verbose "Updating the (id=${id}) product ..." ;;
+    esac
+    stripe_JSON                         \
+        products "${command}"           \
+        --confirm                       \
+        --tax-code="${STRIPE_TAX_CODE}" \
+        --data metadata[prog]=pstripe   \
+        ${id:+          --id="${id}"                    } \
+        ${name:+        --name="${name}"                } \
+        ${description:+ --description="${description}"  } \
+        ${url:+         --url="${url}"                  }
+    ## Get product id.
+    if test ! -n "${id}"; then
+        local id="$(jq -r '.id' <<< "${JSON}")"
+        verbose "Created new product with (id=${id})"
+    fi
+    ## Add new price if amount/period specified.
+    if test -n "${amount}" || test -n "${period}"; then
+        verbose "Creating new price: ${amount}-${CURRENCY} ${period_unit}-${period_count} ..."
+        stripe_JSON                                       \
+            prices create                                 \
+            --product="${id}"                             \
+            --unit-amount="${amount}"                     \
+            --currency="${CURRENCY}"                      \
+            --data "recurring[interval]=${period_unit}"   \
+            --data "recurring[usage_type]=licensed"       \
+            --data "recurring[interval_count]=${period_count}"
+        local price_id="$(jq -r '."id"' <<< "${JSON}")"
+        verbose "Created new price: ${price_id}"
+        stripe_JSON                 \
+            products update "${id}" \
+            --data default_price="${price_id}"
+    fi
+}
+## -----------------------------------------------------------------------------
+## ---- CUSTOMERS --------------------------------------------------------------
+## -----------------------------------------------------------------------------
+pstripe_userlist() {
+    local last=
+    while true; do
+        stripe_JSON customers list --limit=100 ${last:+ --starting-after="${last}" }
+        if test ! -n "${JSON}"; then
+            break
+        fi
+        local has_more="$(jq -r '.has_more'    <<< "${JSON}")"
+        local last="$(    jq -r '.data[-1].id' <<< "${JSON}")"
+        jq -r '.data[] |
+               .id              + " " +
+               .email           + " " +
+               .metadata.status + " " +
+               (.preferred_locales[0]|tostring)' <<< "${JSON}" \
+        | xargs printf '%s %-20s %-10s %s\n'  
+        if test ! @"${has_more}" = @"true"; then
+            break
+        fi
+    done
+}
+pstripe_useradd_JSON() {
+    ## Parse command line arguments.
+    local email= pass= lang= interactive= status=
+    while test -n "${1}"; do
+        local var="$(sed -n 's|=.*||p'     <<< "${1}")"
+        local val="$(sed -n 's|^[^=]*=||p' <<< "${1}")"
+        case "${var}" in
+            i|interactive) interactive="${val}" ;;
+            e|email)       email="${val}"       ;;
+            p|pass)        pass="${val}"        ;;
+            l|lang)        lang="$(pstripe_lang "${val}")" ;;
+            s|status)      status="${val}"      ;;
+            *)             error "Invalid argument: ${1}."; return 1;;
+        esac
+        shift
+    done
+    ## Fill interactively.
+    if test -n "${interactive}"; then
+        while test ! -n "${email}"; do
+            read -p "E-mail address: " email >&2
+        done
+        while test ! -n "${pass}"; do
+            read -s -p "Password: "         pass1 >&2; echo >&2
+            read -s -p "Re-type password: " pass2 >&2; echo >&2
+            if test @"${pass1}" = @"${pass2}"; then
+                local pass="${pass1}"
+            else
+                error "The passwords do not match."
+                continue
+            fi
+        done
+    fi
+    ## Check mail and password.
+    case "${email}" in
+        *@*) true;;
+        *)   error "Invalid email address (1)"; return 2;;
+    esac
+    local pass_chk="$(cracklib-check <<< "${pass}" | sed 's|.*: *||')"
+    case "${pass_chk}" in
+        '') error "Password check failed."; return 1;;
+        OK) true;;
+        *)  error "The password, ${pass_chk}"; return 3;;
+    esac
+    local pass_hash="$(openssl passwd -1 -salt "${PSTRIPE_SALT}" -stdin <<< "${pass}")"
+    ## Search the email already is assigned.
+    stripe_JSON customers list --limit=1 --data email="${email}"
+    JSON="$(jq '.data[0]' <<< "${JSON}")"
+    if test ! @"${JSON}" = @"null"; then
+        error "There's already a user with the email address."
+        error "email=${email} customer=$(jq '.id' <<< "${JSON}")"
+        return 4
+    fi
+    ## Create the customer.
+    stripe_JSON customers create                                \
+                --data email="${email}"                         \
+                --data metadata[hash1]="${pass_hash}"           \
+                --data metadata[status]="${status:-unverified}" \
+                ${lang:+ --data preferred_locales[0]="${lang}" }
+    if test -n "${VERBOSE}"; then
+        verbose "Created new customer $(jq -r '.id' <<< "${JSON}")."
+    fi
+}
+pstripe_useradd_mail() {
+    local JSON=''
+    pstripe_useradd_JSON "$@"
+    local id="$(jq -r '.id' <<< "${JSON}")"
+    pstripe_send_verify "${id}"
+}
+pstripe_usermod_JSON() {
+    local pass_hash='' tax_id=''
+    ## Require the ID.
+    if test -n "${1}"; then
+        local id="${1}"
+        shift
+    else
+        error "Please specify a customer ID."
+        return 1
+    fi
+    ## Get command line arguments.
+    local a_city= a_country= a_line1= a_line2= a_postal_code= a_state=
+    local description= email= phone= name=
+    local cif=
+    local pass= verified=
+    while test -n "${1}"; do
+        local var="$(sed -n 's|=.*||p'     <<< "${1}")"
+        local val="$(sed -n 's|^[^=]*=||p' <<< "${1}")"
+        case "${var}" in
+            a_*)           local "${var}"="${val}"    ;;
+            d|description) local description="${val}" ;;
+            e|email)       local email="${val}"       ;;
+            p|phone)       local phone="${val}"       ;;
+            n|name)        local name="${val}"        ;;
+            cif)           local cif="${val}"         ;;
+            pass)          local pass="${val}"        ;;
+            status)        local status="${val}"      ;;
+            *)             error "Invalid argument: ${1}"; return 1;;
+        esac
+        shift
+    done
+    pass_hash="$(openssl passwd -1 -salt "${PSTRIPE_SALT}" -stdin <<< "${pass}")"
+    ## Perform modification.
+    verbose "Modifying customer ${id} ..."
+    stripe_JSON customers update "${id}"                                           \
+                ${a_city:+        --data address[city]="${a_city}"               } \
+                ${a_country:+     --data address[country]="${a_country}"         } \
+                ${a_line1:+       --data address[line1]="${a_line1}"             } \
+                ${a_line2:+       --data address[line2]="${a_line2}"             } \
+                ${a_postal_code:+ --data address[postal_code]="${a_postal_code}" } \
+                ${a_state:+       --data address[state]="${a_state}"             } \
+                ${description:+   --description="${description}"                 } \
+                ${email:+         --email="${email}"                             } \
+                ${phone:+         --phone="${phone}"                             } \
+                ${name:+          --name="${name}"                               } \
+                ${pass:+          --data metadata[hash1]="${pass_hash}"          } \
+                ${status:+        --data metadata[status]="${status}"            }
+    if test @"${JSON:-null}" = @"null"; then
+        error "The user does not exist."
+        return 1
+    fi
+    local JSON_USER="${JSON}"
+    ## Change cif.
+    if test -n "${cif}"; then
+        stripe_curl_JSON \
+            "https://api.stripe.com/v1/customers/${id}/tax_ids" \
+            -G -d limit=100
+        for tax_id in $(jq -r '.data[] | .id' <<< "${JSON}"); do
+            verbose "Deleting tax_id ${tax_id} ..."
+            stripe_curl_JSON \
+                "https://api.stripe.com/v1/customers/${id}/tax_ids/${tax_id}" \
+                -X DELETE
+        done
+        verbose "Setting tax id of ${id} to es_cif/${cif} ..."
+        stripe_curl_JSON \
+            "https://api.stripe.com/v1/customers/${id}/tax_ids" \
+            -d type="es_cif" \
+            -d value="${cif}"
+    fi
+    JSON="${JSON_USER}"
+}
+pstripe_userdel() {
+    local id= JSON=
+    for id in "$@"; do
+        verbose "Deleting customer ${id} ..."
+        stripe_curl_JSON -X DELETE "https://api.stripe.com/v1/customers/${id}"
+    done
+}
+pstripe_test_verify() {
+    local JSON='' user='' code=''
+    
+    ## Parse command line arguments.
+    user="$1"
+    if test ! -n "${user}"; then
+        error "Please specify an email address."
+        return 1
+    fi
+    shift
+
+    ## Generate mail code and set.
+    code="`uuidgen -r`"
+    stripe_JSON customers update \
+                "${user}"        \
+                --data metadata[ecode]="${code}" \
+                --data metadata[status]="unverified"
+    if test ! -n "${JSON}"; then
+        error "User ${user} not found."
+        return 1
+    fi
+
+    ## Print code.
+    printf '%s %s\n' "$(jq -r '.email' <<< "${JSON}")" "${code}"
+}
+pstripe_send_verify() {
+    ## Check configuration.
+    if test ! -n "${PSTRIPE_ORGANIZATION_NAME}"; then
+        error "Please set PSTRIPE_ORGANIZATION_NAME."
+        return 1
+    fi
+    if test ! -n "${PSTRIPE_VERIFY_MAIL_HOOK}"; then
+        error "Please set PSTRIPE_VERIFY_MAIL_HOOK."
+        return 1
+    fi
+    if test -n "${PSTRIPE_VERIFY_MAIL_TEMPLATE}"; then
+        local tmpl="${PSTRIPE_VERIFY_MAIL_TEMPLATE}"
+    else
+        local tmpl="pstripe_template_verify_mail"
+    fi
+    
+    ## Check command line arguments.
+    local user="$1"
+    if test ! -n "${user}"; then
+        error "Please specify an email address."
+        return 1
+    fi
+    shift
+    
+    ## Generate mail code and set.
+    local code="`uuidgen -r`"
+    stripe_JSON customers update \
+                "${user}"        \
+                --data metadata[ecode]="${code}" \
+                --data metadata[status]="unverified"
+    if test ! -n "${JSON}"; then
+        error "User ${user} not found."
+        return 1
+    fi
+
+    ## Get the email address.
+    local email="$(jq -r '.email' <<< "${JSON}")"
+    if test @"${email:-null}" = @"null"; then
+        error "User ${user} has no mail account."
+        return 1
+    fi
+
+    ## Get language.
+    local lang="$(jq -r '.preferred_locales[0]' <<< "${JSON}")"
+    if test @"${lang:-null}" = @"null"; then
+        local lang="en-EN"
+    fi
+    
+    ## Generate mail and send.
+    local pars="s=${PSTRIPE_SERVICE}&op=verify&email=${email}&code=${code}"
+    local macc="${PSTRIPE_MSMTP_ACCOUNT}"
+    info "Sending mail to ${email} ..."
+    "${tmpl}"                                     \
+        org="${PSTRIPE_ORGANIZATION_NAME}"        \
+        url="${PSTRIPE_VERIFY_MAIL_HOOK}?${pars}" \
+        email="${email}"                          \
+        lang="${lang}"                            \
+        |                                         \
+        msmtp -t ${macc:+ -a "${macc}" }
+}
+pstripe_recv_verify() {
+    local email="$1" code="$2"
+    if test ! -n "${email}"; then
+        error "Please specify an email account."
+        return 1
+    elif test ! -n "${code}"; then
+        error "Please specify the verification code."
+        return 1
+    fi
+    stripe_JSON customers list --limit=1 --email="${email}"
+    JSON="$(jq '.data[0]' <<< "${JSON}")"
+    
+    if test @"${JSON:-null}" = @"null"; then
+        error "Email not found."
+        return 1
+    fi
+    local customer="$( jq -r '.id'              <<< "${JSON}")"
+    local status="$(   jq -r '.metadata.status' <<< "${JSON}")"
+    local ecode="$(    jq -r '.metadata.ecode'  <<< "${JSON}")"
+    if test ! @"${status}" = @"unverified"; then
+        return 0
+    elif test ! @"${ecode}" = @"${code}"; then
+        error "Not matching code."
+        return 1
+    fi
+    verbose "Verifying ${email} -> ${customer} ${code}"
+    stripe_JSON customers update "${customer}"     \
+                --data metadata[status]="verified" \
+                --data metadata[ecode]=""
+}
+pstripe_template_verify_mail() {
+    local "$@"
+    cat <<-EOF
+	To: ${email}
+	Subject: Verify your email for ${org}.
+	
+	Click this link to verify your account.
+	${url}
+	EOF
+}
+## -----------------------------------------------------------------------------
+## ---- CUSTOMER AUTHENTICATION ------------------------------------------------
+## -----------------------------------------------------------------------------
+pstripe_login() {
+    local JSON= RES=
+    pstripe_login_JSON_RES "$@"
+    case "${RES}" in
+        cus_*) printf '%s\n' "${RES}"; return 0;;
+        *)     return 1;;
+    esac
+}
+pstripe_login_JSON_RES() {
+    RES="error"
+    ## Local variables.
+    local var='' val='' status='' hash_good='' hash_pass='' prods='' prods_cmd=''
+    ## Parse command line arguments.
+    local email='' pass='' interactive='' auth=''
+    while test -n "${1}"; do
+        var="$(sed -n 's|=.*||p'     <<< "${1}")"
+        val="$(sed -n 's|^[^=]*=||p' <<< "${1}")"
+        case "${var}" in
+            i|interactive) interactive="${val}" ;;
+            e|email)       email="${val}"       ;;
+            p|pass)        pass="${val}"        ;;
+            a|auth)        auth="${val}"        ;;
+            *)             error "Invalid argument: ${1}."; return 1;;
+        esac
+        shift
+    done
+    ## Fill interctively.
+    if test -n "${interactive}"; then
+        if test ! -n "${email}"; then
+            read -p "E-mail address: " email >&2
+        fi
+        if test ! -n "${pass}"; then
+            read -s -p "Password: " pass >&2
+            echo >&2
+        fi
+    fi
+    ## Search the account.
+    stripe_JSON customers list --limit=1 --expand=data.subscriptions --email="${email}"
+    JSON="$(jq '.data[0]' <<< "${JSON}")"
+    if test @"${JSON:-null}" = @"null"; then
+        JSON="" RES="not-found-user"
+        error "User not found: ${email}"
+        return 0
+    fi
+    ## Require it is verified.
+    status="$(jq -r '.metadata.status' <<< "${JSON}")"
+    if test ! @"${status}" = @"verified"; then
+        JSON="" RES="not-found-user"
+        error "User not verified."
+        return 0
+    fi
+    ## Get password.
+    hash_good="$(jq -r '.metadata.hash1' <<< "${JSON}")"
+    hash_pass="$(openssl passwd -1 -salt "${PSTRIPE_SALT}" -stdin <<< "${pass}")"
+    if test @"${hash_good:-null}" = @"null"; then
+        JSON="" RES="not-found-pass"
+        error "User not found."
+        return 0
+    fi
+    ## Check password.
+    if test ! @"${hash_good}" = @"${hash_pass}"; then
+        JSON="" RES="invalid-password"
+        error "Invalid password."
+        return 0
+    fi
+    ## Check it is allowed to the service.
+    if test -n "${auth}"; then
+        local p= found= prods_cmd='
+        .subscriptions.data[]       |
+        select(.status == "active") |
+        .items.data[]               |
+        .price.product'
+        for p in $(jq -r "${prods_cmd}" <<< "${JSON}"); do
+            if test @"${p}" = @"${auth}"; then
+                found=y
+                break
+            fi
+        done
+        if test !  @"${found}" = @"y"; then
+            JSON="" RES="not-allowed"
+            error "Not allowed to the service."
+            return 0
+        fi
+    fi
+    
+    ## Set ID in result.
+    RES="$(jq -r '.id' <<< "${JSON}")"
+}
+pstripe_auths() {
+    if test -n "${1}"; then
+        local id="$1"
+    else
+        error "Please specify a customer ID."
+        return 1
+    fi
+    stripe_JSON customers retrieve "${id}" --expand=subscriptions
+    if test @"${JSON:-null}" = @"null"; then
+        return 0
+    fi
+    jq -r '
+    .subscriptions.data[]       |
+    select(.status == "active") |
+    .items.data[]         |
+    .price.product
+    ' <<< "${JSON}"
+}
+pstripe_userinfo_JSON() {
+    if test -n "${1}"; then
+        local id="$1"
+    else
+        error "Please specify a customer ID."
+        return 1
+    fi
+    stripe_JSON customers retrieve "${id}" --expand=subscriptions
+}
+## -----------------------------------------------------------------------------
+## ---- CHECKOUT ---------------------------------------------------------------
+## -----------------------------------------------------------------------------
+pstripe_session_new_ID_URL() {
+    ID='' URL=''
+    local var='' val='' price='' lang=''
+
+    ## Check configuration.
+    if test ! -n "${STRIPE_TAX_RATE}"; then
+        error "Please set STRIPE_TAX_RATE."
+        return 1
+    fi
+    
+    ## Parse command line arguments.
+    local subs=()
+    local url_success='' url_cancel=''
+    local customer='' reference='' browser=''
+    while test -n "${1}"; do
+        var="$(sed -n 's|=.*||p'     <<< "${1}")"
+        val="$(sed -n 's|^[^=]*=||p' <<< "${1}")"
+        case "${var}" in
+            s|subs)         local subs+=( "${val}" )   ;;
+            us|url_success) local url_success="${val}" ;;
+            uc|url_cancel)  local url_cancel="${val}"  ;;
+            c|customer)     local customer="${val}"    ;;
+            r|reference)    local reference="${val}"   ;;
+            b|browser)      local browser="${val}"     ;;
+            *)              error "Invalid argument: ${var}"; return 1;;
+        esac
+        shift
+    done
+    
+    ## Check required fields.
+    if test ! -n "${url_success}"; then
+        error "Please specify a success URL with (us=)."
+        return 1
+    elif test ! -n "${url_cancel}"; then
+        error "Please specify a cancel URL with (uc=)."
+        return 1
+    elif test ! -n "${subs}"; then
+        error "Please specify at least one subscription product (s=)."
+        return 1
+    elif test ! -n "${customer}"; then
+        error "Please specify a customer id/email (c=)."
+        return 1
+    fi
+    
+    ## Get customer information.
+    case "${customer}" in
+        *@*) stripe_JSON customers list --limit=1 --email="${customer}"
+             JSON="$(jq '.data[0]' <<< "${JSON}")"
+             customer="$(jq -r '.id' <<< "${JSON}")"
+             ;;
+        *)   stripe_JSON customers retrieve "${customer}"
+             ;;
+    esac
+    if test @"${JSON:-null}" = @"null"; then
+        error "Customer ${customer} not found."
+        return 1
+    fi
+            
+    ## Get language.
+    lang="$(jq -r '.preferred_locales[0]' <<< "${JSON}" | sed 's|[_-].*||')"
+    if test @"${lang}" = @"null"; then
+        lang=""
+    fi
+    
+    ## Add items.
+    local items=() itemsz=0 s=
+    for s in "${subs[@]}"; do
+        stripe_JSON products retrieve "${s}"
+        if test @"${JSON:-null}" = @"null"; then
+            error "No subscription product with id ${s}."
+            return 1
+        fi
+        price="$(jq -r '.default_price' <<< "${JSON}")"
+        if test @"${price:-null}" = @"null"; then
+            error "Please specify a price."
+            return 1
+        fi
+        items+=(
+            --data line_items["${itemsz}"][price]="${price}"
+            --data line_items["${itemsz}"][quantity]='1'
+            --data line_items["${itemsz}"][tax_rates][0]="${STRIPE_TAX_RATE}"
+        )
+        (( ++itemsz ))
+    done
+    ## Create session.
+    verbose "Creating new session for ${customer} with ${itemsz} items ..."
+    stripe_JSON checkout sessions create       \
+                --success-url="${url_success}" \
+                --cancel-url="${url_cancel}"   \
+                --mode="subscription"          \
+                --customer="${customer}"       \
+                ${lang:+      --locale="${lang}"                   } \
+                ${reference:+ --client-reference-id="${reference}" } \
+                "${items[@]}"
+    if test @"${JSON:-null}" = @"null"; then
+        error "Customer ${customer} not found."
+        return 1
+    fi
+
+    ## Get ID and URL.
+    ID="$(  jq -r '.id'  <<< "${JSON}")"
+    URL="$( jq -r '.url' <<< "${JSON}")"
+    if test @"${ID:null}" = @"null" || test @"${URL:-null}" = @"null"; then
+        error "Unexpected error"
+        return 1
+    fi
+
+    verbose "Created new session ${ID}"
+    verbose "URL: ${URL}"
+
+    ## Open browser if specified.
+    case "${browser}" in
+        '')    true                                ;;
+        y|yes) xdg-open "${URL}" >/dev/null 2>&1 & ;;
+        *)     "${browser}" "${URL}"               ;;
+    esac
+}
+## -----------------------------------------------------------------------------
+## ---- HOOKS ------------------------------------------------------------------
+## -----------------------------------------------------------------------------
+pstripe_hook_verify() {
+    pstripe_cgi_require_variables email code
+    ecode pstripe_recv_verify "${h_email}" "${h_code}"
+    if test "${ecode}" = "0"; then
+        pstripe_cgi_success_exit "Success"
+    else
+        pstripe_cgi_error_exit "400"
+    fi
+}
+pstripe_hook_login() {
+    local JSON='' RES=''
+    pstripe_cgi_require_variables email pass
+    pstripe_login_JSON_RES email="${h_email}" pass="${h_pass}" auth="${h_auth}"
+    case "${RES}" in
+        cus_*)
+            pstripe_cgi_success_exit "${RES}"
+            ;;
+        *)
+            pstripe_cgi_error_exit "400"
+            ;;
+    esac
+}
+pstripe_hook_register() {
+    local JSON='' RES=''
+    pstripe_cgi_require_variables email pass
+    ecode pstripe_useradd_mail email="${h_email}" pass="${h_pass}" lang="${h_lang}"
+    case "${ecode}" in
+        0) pstripe_cgi_success_exit "Success";;
+        1) pstripe_cgi_error_exit "401";;
+        2) pstripe_cgi_error_exit "402";; ## Invalid email address.
+        3) pstripe_cgi_error_exit "403";; ## Insecure password.
+        4) pstripe_cgi_error_exit "404";; ## The account already exists.
+    esac
+}
+pstripe_hook_auths() {
+    pstripe_cgi_require_variables user
+    local cache="${PSTRIPE_CACHE}/${TEST_MODE:+test}-${h_user}.txt"
+    local time="$(( $(date '+%s') - 60))"
+    if test -e "${cache}" && test "${time}" -gt "$(stat -c '%Y' "${cache}")"; then
+        local auths="$(cat "${cache}")"
+    else
+        local auths="$(pstripe_auths "${h_user}")"
+        mkdir -p "${PSTRIPE_CACHE}"
+        cat > "${cache}" <<< "${auths}"
+    fi
+    pstripe_cgi_success_exit "${auths}"
+}
+pstripe_hook_userinfo() {
+    local JSON=
+    pstripe_cgi_require_password
+    pstripe_cgi_require_variables user
+    pstripe_userinfo_JSON "${h_user}"
+    pstripe_cgi_success_exit "${JSON}"
+}
+pstripe_hook_usermod() {
+    local JSON=
+    pstripe_cgi_require_password
+    pstripe_cgi_require_variables user
+    pstripe_usermod_JSON                   \
+        "${h_user}"                        \
+        a_city="${h_a_city}"               \
+        a_country="${h_a_country}"         \
+        a_line1="${h_a_line1}"             \
+        a_line2="${h_a_line2}"             \
+        a_postal_code="${h_a_postal_code}" \
+        a_state="${h_a_state}"             \
+        n="${h_name}"                      \
+        p="${h_phone}"                     \
+        cif="${h_cif}"
+    pstripe_cgi_success_exit "${JSON}"
+}
+pstripe_hook_ses_new() {
+    local ID='' URL=''
+    pstripe_cgi_require_password
+    pstripe_cgi_require_variables user product url_success url_cancel
+    local cache="${PSTRIPE_CACHE}/${TEST_MODE:+test}-${h_user}.txt"
+    rm -f "${cache}"
+    pstripe_session_new_ID_URL   \
+        s="${h_product}"         \
+        c="${h_user}"            \
+        us="${h_url_success}"    \
+        uc="${h_url_cancel}"
+    info "Created new session URL: ${URL}"
+    pstripe_cgi_success_exit "${URL}"
+}
+## -----------------------------------------------------------------------------
+## ---- CGI --------------------------------------------------------------------
+## -----------------------------------------------------------------------------
+pstripe_cgi_require_password() {
+    if test ! -n "${PSTRIPE_HOOK_SECRET}"; then
+        error "LOTORIUS_PASS not set."
+        exit 1
+    fi
+    if test ! @"${PSTRIPE_HOOK_SECRET}" = @"${h_secret}"; then
+        error "Received an unauthorized request."
+        exit 1
+    fi
+}
+pstripe_cgi_require_variables() {
+    local v=
+    for v in "$@"; do
+        if test ! -v "h_${v}"; then
+            pstripe_cgi_error_exit 400 "Missing parameter: ${v}"
+        fi
+    done
+}
+pstripe_cgi_html_pipe() {
+    if test -n "${PSTRIPE_HTML_TEMPLATE}"; then
+        "${PSTRIPE_HTML_TEMPLATE}"
+    else
+        echo "<HTML>"
+        echo "  <BODY>"
+        cat
+        echo "  </BODY>"
+        echo "</HTML>"
+    fi
+}
+pstripe_cgi_success_exit() { # RAW-MESSAGE
+    if test -n "${h_textmode}"; then
+        echo "Content-type: text/raw"
+        echo ""
+        printf '%s\n' "$*"
+    else
+        echo "Content-type: text/html"
+        echo ""
+        pstripe_cgi_html_pipe <<< "${*}"
+    fi
+    exit 0
+}
+pstripe_cgi_error_exit() { # CODE MESSAGE
+    echo "Status: ${1:-400} ERROR"
+    if test -n "${h_textmode}"; then
+        echo "Content-type: text/raw"
+        echo ""
+        if test -e "${PSTRIPE_ERRORS}"; then
+            cat "${PSTRIPE_ERRORS}"
+        fi
+    else
+        echo "Content-type: text/html"
+        echo ""
+        echo "<HTML>"
+        echo "  <BODY>"
+        if test -e "${PSTRIPE_ERRORS}"; then
+            sed 's|^ *\(.*\)$|<P>\1</P>|' "${PSTRIPE_ERRORS}"
+        fi
+        echo "  </BODY>"
+        echo "</HTML>"
+    fi
+    rm -f "${PSTRIPE_ERRORS}"
+    exit 0
+}
+## -----------------------------------------------------------------------------
+## ---- AUXILIARY --------------------------------------------------------------
+## -----------------------------------------------------------------------------
+
+
+stripe_JSON() {
+    if test @"${TEST_MODE}" = @"yes"; then
+        JSON="$(env STRIPE_API_KEY="${STRIPE_TEST_SECRET_KEY}" stripe "$@")"
+    else
+        JSON="$(env STRIPE_API_KEY="${STRIPE_SECRET_KEY}" stripe "$@")"
+    fi
+    local msg="$( jq -r '."error"."message"' <<< "${JSON}")"
+    local code="$(jq -r '."error"."code"'    <<< "${JSON}")"
+    if test @"${code}" = @"resource_missing"; then
+        JSON=""
+    elif test ! @"${msg}" = @"null"; then
+        error "${msg}"
+        return 1
+    fi
+}
+stripe_curl_JSON() {
+    if test @"${TEST_MODE}" = @"yes"; then
+        JSON="$(curl -s -u "${STRIPE_TEST_SECRET_KEY}:" "$@")"
+    else
+        JSON="$(curl -s -u "${STRIPE_SECRET_KEY}:" "$@")"
+    fi
+    local msg="$( jq -r '."error"."message"' <<< "${JSON}")"
+    local code="$(jq -r '."error"."code"'    <<< "${JSON}")"
+    if test @"${code}" = @"resource_missing"; then
+        JSON=""
+    elif test ! @"${msg}" = @"null"; then
+        error "${msg}"
+        return 1
+    fi
+}
+error() {
+    info "error: $*"
+    echo "$*" >> "${PSTRIPE_ERRORS}"
+}
+info()  {
+    if test -n "${NO_HEADINGS}"; then
+        echo "$*" >&2
+    else
+        echo "${SCRNAME}: $*" >&2
+    fi
+}
+verbose() {
+    if test -n "${VERBOSE}"; then
+        info "$*"
+    fi
+}
+ecode() {
+    set +e; ( set -e; "$@" ); ecode=$?; set -e
+}
+pstripe_lang() {
+    local fr="$1" t=
+    local langs='
+    bg     cs    da    de    el    en     en-GB es    es-419    et    fi
+    fil    fr    fr-CA hr    hu    id     it    ja    ko        lt    lv
+    ms     mt    nb    nl    pl    pt     pt-BR ro    ru        sk    sl
+    sv     th    tr    vi    zh    zh-HK  or    zh-TW
+    '
+    for t in ${langs}; do
+        case "${fr}" in "$t"*) echo "${t}"; return 0;; esac
+    done
+    echo "auto"
+    return 0
+}
+## -----------------------------------------------------------------------------
+## ---- MAIN EXECUTION ---------------------------------------------------------
+## -----------------------------------------------------------------------------
+pstripe_calc_variables
+SCRNAME="`basename "$0"`"
+if test -n "${HOOKER_FILE}"; then
+    ## Search the service and load.
+    if test -n "${h_s}"; then
+        PSTRIPE_SERVICE="${h_s}"
+        if ! which pstripe_"${PSTRIPE_SERVICE}" >/dev/null 2>&1; then
+            pstripe_cgi_error_exit "400" "Invalid service"
+            return 1
+        fi
+        . pstripe_"${PSTRIPE_SERVICE}"
+    fi
+    ## Execute hook.
+    echo "===== CGI ========"   >> "${PSTRIPE_HOOK_LOG}"
+    pstripe_hook               2>> "${PSTRIPE_HOOK_LOG}"
+    rm -f "${PSTRIPE_ERRORS}"
+elif test @"${SCRNAME}" = @"pstripe"; then
+    case "${1}" in
+        ''|-h|--help)
+            sed -n 's/^ *#h: \{0,1\}//p' "$0" | sed "s|\\\$0|${SCRNAME}|g"
+            echo ""
+            sed -n 's/^ *#l: \{0,2\}//p' "$0"
+            ;;
+        *)  pstripe "$@"
+            rm -f "${PSTRIPE_ERRORS}"
+            ;;
+    esac
+fi
