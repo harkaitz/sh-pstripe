@@ -667,11 +667,10 @@ pstripe_send_verify() {
     fi
 
     ## Get language.
-    local lang="$(jq -r '.preferred_locales[0]' <<< "${JSON}")"
+    local lang="$(jq -r '.preferred_locales[0]' <<< "${JSON}" | sed 's|[-_].*||')"
     if test @"${lang:-null}" = @"null"; then
-        local lang="en-EN"
+        local lang="en"
     fi
-    
     ## Generate mail and send.
     local pars="s=${PSTRIPE_SERVICE}&op=verify&email=${email}&code=${code}"
     local macc="${PSTRIPE_MSMTP_ACCOUNT}"
@@ -681,7 +680,7 @@ pstripe_send_verify() {
         url="${PSTRIPE_VERIFY_MAIL_HOOK}?${pars}" \
         email="${email}"                          \
         lang="${lang}"                            \
-        |                                         \
+        | tee /dev/stderr |                                         \
         msmtp -t ${macc:+ -a "${macc}" }
 }
 pstripe_recv_verify() {
@@ -707,6 +706,7 @@ pstripe_recv_verify() {
         return 0
     elif test ! @"${ecode}" = @"${code}"; then
         error "Not matching code."
+        echo "${ecode} != ${code}" >&2
         return 1
     fi
     verbose "Verifying ${email} -> ${customer} ${code}"
