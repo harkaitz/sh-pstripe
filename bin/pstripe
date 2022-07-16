@@ -694,6 +694,7 @@ pstripe_login() {
     pstripe_login_JSON_RES "$@"
     case "${RES}" in
         cus_*) printf '%s\n' "${RES}"; return 0;;
+        admin) printf '%s\n' "${RES}"; return 0;;
         *)     return 1;;
     esac
 }
@@ -729,6 +730,19 @@ pstripe_login_JSON_RES() {
     if test ! -n "${email}"; then
         error "Please specify an email account."
         return 1
+    fi
+    ## Key account.
+    if test -n "${PSTRIPE_KEY_EMAIL}" && \
+       test -n "${PSTRIPE_KEY_PASS}"  && \
+       test @"${PSTRIPE_KEY_EMAIL}" = @"${email}"; then
+        if test @"${PSTRIPE_KEY_PASS}" = @"${pass}"; then
+            JSON="" RES="admin"
+            return 0
+        else
+            JSON="" RES="not-found-user"
+            error "User not found: ${email}"
+            return 0
+        fi
     fi
     ## Search the account.
     stripe_curl_JSON                             \
@@ -791,7 +805,10 @@ pstripe_login_JSON_RES() {
 }
 pstripe_auths() {
     ## Get ID.
-    if test -n "${1}"; then
+    if test @"${1}" = @"admin"; then
+        echo "all"
+        return 0
+    elif test -n "${1}"; then
         local id="$1"
         shift
     else
